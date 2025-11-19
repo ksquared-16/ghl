@@ -2,9 +2,14 @@ from fastapi import FastAPI, Request
 
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"status": "online"}
+
 @app.post("/gohighlevel/webhook")
 async def ghl_webhook(request: Request):
-    payload = await request.json()
-    # For now just log it so we can see what GHL sends
-    print("Received webhook:", payload)
-    return {"status": "ok"}
+    body = await request.json()
+    print("🔔 Incoming GHL Webhook:", body)
+    
+    # Temporary response — we will replace this later
+    return {"received": True, "message": "Webhook OK"}
