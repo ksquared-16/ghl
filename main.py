@@ -8,10 +8,10 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 logger = logging.getLogger("uvicorn")
 
-# Load GHL API Key from Render Environment
+# ---------------------------
+# ENV VARIABLES
+# ---------------------------
 GHL_API_KEY = os.getenv("GHL_API_KEY")
-
-# Base LeadConnector API URL
 GHL_BASE_URL = "https://rest.gohighlevel.com/v1"
 
 
@@ -26,7 +26,7 @@ async def health():
 
 
 # ---------------------------
-# Number helper
+# Helper: strip numbers from messy strings
 # ---------------------------
 def to_number(value):
     if value is None:
@@ -41,7 +41,7 @@ def to_number(value):
 
 
 # ---------------------------
-# Extract estimated price
+# Extract price from payload
 # ---------------------------
 def extract_estimated_price(payload: dict) -> float:
     direct = payload.get("Estimated Price (Contact)") or payload.get("Estimated Price")
@@ -50,8 +50,6 @@ def extract_estimated_price(payload: dict) -> float:
         return num
 
     breakdown = payload.get("Price Breakdown (Contact)") or payload.get("Price Breakdown") or ""
-
-    # Example: "Total: $169"
     match = re.search(r"Total:\s*\$?([0-9]+(?:\.[0-9]+)?)", breakdown)
     if match:
         return float(match.group(1))
@@ -60,15 +58,40 @@ def extract_estimated_price(payload: dict) -> float:
 
 
 # ---------------------------
-# Fetch contractors dynamically from GHL
+# Normalize GHL tags reliably
+# GHL can return tags as:
+# - a list of strings
+# - a comma-separated string
+# - a list of dicts: [{"name": "available_today"}, ...]
+# ---------------------------
+def normalize_tags(raw_tags):
+    if raw_tags is None:
+        return []
+
+    # If already a list of strings
+    if isinstance(raw_tags, list):
+        cleaned = []
+        for t in raw_tags:
+            if isinstance(t, str):
+                cleaned.append(t.lower())
+            elif isinstance(t, dict) and "name" in t:
+                cleaned.append(t["name"].lower())
+        return cleaned
+
+    # If comma-separated string
+    if isinstance(raw_tags, str):
+        return [t.strip().lower() for t in raw_tags.split(",") if t.strip()]
+
+    return []
+
+
+# ---------------------------
+# FETCH CONTRACTORS FROM GHL
 # ---------------------------
 def fetch_contractors_from_ghl():
-    """
-    Pull all contractors with:
-    - contact_source == "contractor-cleaning"
-      OR
-    - tag contains contractor_cleaning
-    """
+    if not GHL_API_KEY:
+        logger.error("GHL_API_KEY missing — contractors cannot be fetched")
+        return []
 
     url = f"{GHL_BASE_URL}/contacts/"
 
@@ -78,13 +101,13 @@ def fetch_contractors_from_ghl():
     }
 
     params = {
-        "limit": 200  # pagination later if needed
+        "limit": 200
     }
 
     response = requests.get(url, headers=headers, params=params)
 
     if response.status_code != 200:
-        logger.error(f"GHL contractor fetch failed: {response.text}")
+        logger.error(f"GHL contact fetch failed: {response.text}")
         return []
 
     data = response.json()
@@ -94,63 +117,67 @@ def fetch_contractors_from_ghl():
 
     for c in contacts:
         source = (c.get("contactSource") or "").lower()
-        tags = [t.lower() for t in c.get("tags", [])]
+        tags = normalize_tags(c.get("tags"))
         phone = c.get("phone")
         name = f"{c.get('firstName','')} {c.get('lastName','')}".strip()
 
+        # Skip if no phone number
         if not phone:
             continue
 
-        if source == "contractor-cleaning" or "contractor_cleaning" in tags:
+        # Contractor detection rules
+        is_source = source == "contractor-cleaning"
+        has_tag = any("contractor" in t for t in tags)
+
+        if is_source or has_tag:
             contractors.append({
                 "id": c.get("id"),
                 "name": name,
                 "phone": phone,
                 "tags": tags,
+                "contact_source": source,
             })
 
     logger.info(f"Fetched {len(contractors)} contractors from GHL")
     return contractors
 
+@app.get("/contractors")
+async def contractors_probe():
+    contractors = fetch_contractors_from_ghl()
+    return {
+        "ok": True,
+        "count": len(contractors),
+        "contractors": contractors,
+    }
 
 # ---------------------------
-# Send SMS (placeholder for Twilio or LC API)
-# ---------------------------
-def send_sms_to_contractor(phone, message):
-    """
-    Placeholder: we will integrate Twilio or LeadConnector SMS here.
-    For now, just log.
-    """
-    logger.info(f"Would send SMS to {phone}: {message}")
-
-
-# ---------------------------
-# DISPATCH ENDPOINT
+# Dispatch endpoint
 # ---------------------------
 @app.post("/dispatch")
 async def dispatch(request: Request):
     payload = await request.json()
     logger.info(f"Received payload from GHL: {payload}")
 
-    # ---------------------------
-    # Extract Job Summary
-    # ---------------------------
+    # Extract calendar
     calendar = payload.get("calendar", {})
     job_id = calendar.get("appointmentId") or calendar.get("id")
     start_time = calendar.get("startTime")
     end_time = calendar.get("endTime")
 
+    # Customer identity
     first_name = (payload.get("first_name") or "").strip()
     last_name = (payload.get("last_name") or "").strip()
     full_name = payload.get("full_name") or f"{first_name} {last_name}".strip()
     customer_name = full_name or "Unknown"
 
+    # Contact + location
     contact_id = payload.get("contact_id")
     phone = payload.get("phone")
     tags = payload.get("tags", "")
     contact_source = payload.get("contact_source")
 
     location = payload.get("location") or {}
+
     full_address = (
         payload.get("full_address")
         or calendar.get("address")
@@ -158,6 +185,7 @@ async def dispatch(request: Request):
         or ""
     )
 
+    # Home/job details
     home_type = payload.get("Home Type") or ""
     sqft = payload.get("Approximate Square Footage") or ""
     bedrooms = payload.get("Bedrooms") or ""
@@ -194,17 +222,13 @@ async def dispatch(request: Request):
 
     logger.info(f"Job summary: {job_summary}")
 
-    # ---------------------------
-    # Fetch contractors from GHL
-    # ---------------------------
+    # Fetch contractors
     contractors = fetch_contractors_from_ghl()
-
     logger.info(f"Contractors found: {contractors}")
 
-    # ---------------------------
-    # Placeholder for next step: sending SMS
-    # ---------------------------
-    # for c in contractors:
-    #     send_sms_to_contractor(c["phone"], "New cleaning job available...")
-
-    return JSONResponse({"ok": True, "job": job_summary, "contractors": contractors})
+    # Return everything for now
+    return JSONResponse({
+        "ok": True,
+        "job": job_summary,
+        "contractors": contractors
+    })
