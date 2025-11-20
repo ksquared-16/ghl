@@ -193,7 +193,6 @@ def send_sms_to_contractor(contact_id: str, message: str):
         logger.error(f"SMS send failed ({resp.status_code}): {resp.text}")
         return False
 
- 
 
 # ---------------------------
 # Dispatch endpoint
