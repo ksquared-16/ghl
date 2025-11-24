@@ -17,13 +17,10 @@ GHL_API_KEY = os.getenv("GHL_API_KEY")
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "ZO1DxVJw65kU2EbHpHLq")
 
 LC_BASE_URL = "https://services.leadconnectorhq.com"
+
 CONTACTS_URL = f"{LC_BASE_URL}/contacts/"
 CONVERSATIONS_URL = f"{LC_BASE_URL}/conversations/messages"
-
-# Custom Objects (Jobs) API
-# If GHL changes the slug, you can override via env: GHL_JOBS_OBJECT_SLUG
-JOBS_OBJECT_SLUG = os.getenv("GHL_JOBS_OBJECT_SLUG", "jobs")
-JOBS_RECORDS_URL = f"{LC_BASE_URL}/objects/{JOBS_OBJECT_SLUG}/records"
+JOBS_OBJECT_URL = f"{LC_BASE_URL}/objects/jobs/records"
 
 # In-memory job store: { job_id (appointmentId): job_summary_dict }
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
@@ -36,10 +33,15 @@ app = FastAPI()
 # ---------------------------------------------------------
 
 def _ghl_headers() -> Dict[str, str]:
+    """
+    Base headers for all GHL / LeadConnector API calls.
+    NOTE: For Custom Objects, LocationId header is REQUIRED.
+    """
     return {
         "Authorization": f"Bearer {GHL_API_KEY}",
         "Version": "2021-07-28",
         "Content-Type": "application/json",
+        "LocationId": GHL_LOCATION_ID,  # 👈 critical for objects API
     }
 
 
@@ -142,52 +144,15 @@ def build_job_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     return job_summary
 
 
-# ---------------------------------------------------------
-# Jobs object updater helpers
-# ---------------------------------------------------------
-
-def update_job_object_on_dispatch(job: Dict[str, Any]) -> None:
+def upsert_job_assignment(job_id: str, contractor_id: str, contractor_name: str) -> None:
     """
-    Create or upsert a Jobs custom object record when a booking is created.
-    Uses external_job_id as the unique key.
+    Upsert the Jobs custom object record based on external_job_id (job_id).
+    We set:
+      - external_job_id
+      - contractor_assigned_id
+      - contractor_assigned_name
+      - job_status = 'assigned'
     """
-    job_id = job.get("job_id")
-    if not job_id:
-        logger.warning("update_job_object_on_dispatch: no job_id, skipping object sync.")
-        return
-
-    payload = {
-        # these match your custom field keys:
-        "uniqueField": "external_job_id",
-        "uniqueValue": job_id,
-        "fields": {
-            "external_job_id": job_id,
-            "job_status": "pending_assignment",
-            "contractor_assigned_id": None,
-            "contractor_assigned_name": None,
-        },
-    }
-
-    logger.info("Updating Jobs object on dispatch via %s with payload: %s", JOBS_RECORDS_URL, payload)
-    try:
-        resp = requests.post(JOBS_RECORDS_URL, headers=_ghl_headers(), json=payload, timeout=10)
-        if resp.status_code in (200, 201):
-            logger.info("Jobs object dispatch upsert OK (%s): %s", resp.status_code, resp.text)
-        else:
-            logger.error("Jobs object dispatch upsert failed (%s): %s", resp.status_code, resp.text)
-    except Exception as e:
-        logger.error("Jobs object dispatch upsert exception: %s", e)
-
-
-def update_job_object_on_assignment(job: Dict[str, Any], contractor_id: str, contractor_name: str) -> None:
-    """
-    Update the Jobs custom object record when a contractor accepts a job.
-    """
-    job_id = job.get("job_id")
-    if not job_id:
-        logger.warning("update_job_object_on_assignment: no job_id, skipping object sync.")
-        return
-
     payload = {
         "uniqueField": "external_job_id",
         "uniqueValue": job_id,
@@ -199,15 +164,30 @@ def update_job_object_on_assignment(job: Dict[str, Any], contractor_id: str, con
         },
     }
 
-    logger.info("Updating Jobs object on assignment via %s with payload: %s", JOBS_RECORDS_URL, payload)
+    logger.info(
+        "Updating Jobs object on assignment via %s with payload: %s",
+        JOBS_OBJECT_URL,
+        payload,
+    )
+
     try:
-        resp = requests.post(JOBS_RECORDS_URL, headers=_ghl_headers(), json=payload, timeout=10)
-        if resp.status_code in (200, 201):
-            logger.info("Jobs object assignment upsert OK (%s): %s", resp.status_code, resp.text)
-        else:
-            logger.error("Jobs object assignment upsert failed (%s): %s", resp.status_code, resp.text)
+        resp = requests.post(JOBS_OBJECT_URL, headers=_ghl_headers(), json=payload, timeout=10)
     except Exception as e:
         logger.error("Jobs object assignment upsert exception: %s", e)
+        return
+
+    if not resp.ok:
+        logger.error(
+            "Jobs object assignment upsert failed (%s): %s",
+            resp.status_code,
+            resp.text,
+        )
+    else:
+        logger.info(
+            "Jobs object assignment upsert OK (%s): %s",
+            resp.status_code,
+            resp.text,
+        )
 
 
 # ---------------------------------------------------------
@@ -243,9 +223,8 @@ async def dispatch(request: Request):
     """
     Webhook from GHL when an appointment is booked (or when we manually trigger via curl).
     1. Build a job summary and cache it in JOB_STORE (keyed by job_id / appointmentId).
-    2. Upsert the job into the Jobs custom object as 'pending_assignment'.
-    3. Fetch eligible contractors.
-    4. Send SMS to each contractor with "Reply YES <job_id> to accept."
+    2. Fetch eligible contractors.
+    3. Send SMS to each contractor with "Reply YES <job_id> to accept."
     """
     payload = await request.json()
     logger.info("Received payload from GHL: %s", payload)
@@ -257,10 +236,8 @@ async def dispatch(request: Request):
     if job_id:
         JOB_STORE[job_id] = job_summary
         logger.info("Cached job in memory with id=%s. JOB_STORE now has %d jobs.", job_id, len(JOB_STORE))
-        # Sync to Jobs object
-        update_job_object_on_dispatch(job_summary)
     else:
-        logger.warning("No job_id in job_summary; not caching or syncing this job.")
+        logger.warning("No job_id in job_summary; not caching this job.")
 
     contractors = fetch_contractors()
     logger.info("Contractors found: %s", contractors)
@@ -307,7 +284,6 @@ async def contractor_reply(request: Request):
     Webhook from GHL when a *contractor* replies to the dispatch SMS.
     Expected formats we've wired up:
       - { "contact_id": "...", "message": "YES <job_id>" }
-
     If needed, we also try to fall back to:
       - customData.body
       - message.body (when GHL sends a message object)
@@ -398,9 +374,9 @@ async def contractor_reply(request: Request):
         )
         send_conversation_sms(customer_contact_id, customer_msg)
 
-    # 4) Update the Jobs custom object record
-    if contact_id:
-        update_job_object_on_assignment(job, contractor_id=contact_id, contractor_name=contractor_name)
+    # 4) Update Jobs custom object with assignment
+    if job_id and contact_id:
+        upsert_job_assignment(job_id, contact_id, contractor_name)
 
     logger.info(
         "contractor-reply: job %s assigned to contractor %s (%s)",
