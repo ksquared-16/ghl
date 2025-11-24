@@ -1,290 +1,220 @@
 import os
-import re
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-logger = logging.getLogger("uvicorn")
+# ---------------------------------------------------------
+# Config & globals
+# ---------------------------------------------------------
 
-# ---------------------------
-# ENV VARIABLES
-# ---------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("alloy-dispatcher")
+
 GHL_API_KEY = os.getenv("GHL_API_KEY")
-GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")  # ZO1DxVJw65kU2EbHpHLq
-GHL_BASE_URL = "https://services.leadconnectorhq.com"
-GHL_CONTACTS_URL = f"{GHL_BASE_URL}/contacts/"
-GHL_CONVERSATIONS_URL = f"{GHL_BASE_URL}/conversations/messages/"
+GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "ZO1DxVJw65kU2EbHpHLq")
 
-# Simple in-memory store: job_id -> job info
+LC_BASE_URL = "https://services.leadconnectorhq.com"
+CONTACTS_URL = f"{LC_BASE_URL}/contacts/"
+CONVERSATIONS_URL = f"{LC_BASE_URL}/conversations/messages"
+
+# In-memory job store: { job_id (appointmentId): job_summary_dict }
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
 
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Alloy dispatcher root"}
+app = FastAPI()
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "message": "Alloy dispatcher is live"}
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 
-
-# ---------------------------
-# Helper: strip numbers from messy strings
-# ---------------------------
-def to_number(value):
-    if value is None:
-        return None
-    cleaned = re.sub(r"[^\d.]", "", str(value))
-    if cleaned == "":
-        return None
-    try:
-        return float(cleaned)
-    except Exception:
-        return None
-
-
-# ---------------------------
-# Extract price from payload
-# ---------------------------
-def extract_estimated_price(payload: dict) -> float:
-    direct = payload.get("Estimated Price (Contact)") or payload.get("Estimated Price")
-    num = to_number(direct)
-    if num is not None:
-        return num
-
-    breakdown = payload.get("Price Breakdown (Contact)") or payload.get("Price Breakdown") or ""
-    match = re.search(r"Total:\s*\$?([0-9]+(?:\.[0-9]+)?)", breakdown)
-    if match:
-        return float(match.group(1))
-
-    return 0.0
-
-
-# ---------------------------
-# Normalize GHL tags reliably
-# ---------------------------
-def normalize_tags(raw_tags):
-    if raw_tags is None:
-        return []
-
-    # Already a list
-    if isinstance(raw_tags, list):
-        cleaned = []
-        for t in raw_tags:
-            if isinstance(t, str):
-                cleaned.append(t.lower())
-            elif isinstance(t, dict) and "name" in t:
-                cleaned.append(t["name"].lower())
-        return cleaned
-
-    # Comma-separated string
-    if isinstance(raw_tags, str):
-        return [t.strip().lower() for t in raw_tags.split(",") if t.strip()]
-
-    return []
-
-
-# ---------------------------
-# FETCH CONTRACTORS FROM GHL
-# ---------------------------
-def fetch_contractors_from_ghl():
-    if not GHL_API_KEY or not GHL_LOCATION_ID:
-        logger.error("GHL_API_KEY or GHL_LOCATION_ID missing — contractors cannot be fetched")
-        return []
-
-    headers = {
+def _ghl_headers() -> Dict[str, str]:
+    return {
         "Authorization": f"Bearer {GHL_API_KEY}",
-        "Accept": "application/json",
         "Version": "2021-07-28",
+        "Content-Type": "application/json",
     }
 
+
+def fetch_contractors() -> List[Dict[str, Any]]:
+    """
+    Fetch contractors from GHL contacts API, filtered by tags.
+    Currently: contractor_cleaning + job-pending-assignment.
+    """
     params = {
-        "limit": 100,
         "locationId": GHL_LOCATION_ID,
+        "limit": 50,
     }
+    try:
+        resp = requests.get(CONTACTS_URL, headers=_ghl_headers(), params=params, timeout=10)
+    except Exception as e:
+        logger.error("GHL contact fetch exception: %s", e)
+        return []
 
-    resp = requests.get(GHL_CONTACTS_URL, headers=headers, params=params)
-    if resp.status_code != 200:
-        logger.error(f"GHL contact fetch failed ({resp.status_code}): {resp.text}")
+    if not resp.ok:
+        logger.error("GHL contact fetch failed (%s): %s", resp.status_code, resp.text)
         return []
 
     data = resp.json()
     contacts = data.get("contacts", [])
-
-    contractors = []
+    contractors: List[Dict[str, Any]] = []
 
     for c in contacts:
-        source = (c.get("source") or "").lower()
-        tags = normalize_tags(c.get("tags"))
-        phone = c.get("phone")
-        name = f"{c.get('firstName','')} {c.get('lastName','')}".strip() or c.get("contactName", "").strip()
-
-        if not phone:
-            continue
-
-        is_source = source == "contractor-cleaning"
-        has_tag = any("contractor_cleaning" in t for t in tags)
-
-        if is_source or has_tag:
+        tags = c.get("tags") or []
+        if "contractor_cleaning" in tags and "job-pending-assignment" in tags:
             contractors.append(
                 {
                     "id": c.get("id"),
-                    "name": name,
-                    "phone": phone,
+                    "name": c.get("contactName") or f"{c.get('firstName', '')} {c.get('lastName', '')}".strip(),
+                    "phone": c.get("phone"),
                     "tags": tags,
-                    "contact_source": source,
+                    "contact_source": c.get("source") or "",
                 }
             )
 
-    logger.info(f"Fetched {len(contractors)} contractors from GHL")
+    logger.info("Fetched %d contractors from GHL", len(contractors))
     return contractors
 
 
-@app.get("/contractors")
-async def contractors_probe():
-    contractors = fetch_contractors_from_ghl()
-    return {
-        "ok": True,
-        "count": len(contractors),
-        "contractors": contractors,
-    }
-
-
-# ---------------------------
-# SEND SMS VIA CONVERSATIONS API
-# ---------------------------
-def send_sms_to_contact(contact_id: str, message: str):
+def send_conversation_sms(contact_id: str, message: str) -> None:
     """
-    Unified helper to send an SMS to any contact via Conversations API.
+    Send an SMS via GHL Conversations API.
     """
-    if not GHL_API_KEY or not GHL_LOCATION_ID:
-        logger.error("Missing GHL_API_KEY or GHL_LOCATION_ID, cannot send SMS")
-        return False
-
-    headers = {
-        "Authorization": f"Bearer {GHL_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Version": "2021-07-28",
-    }
-
     payload = {
         "locationId": GHL_LOCATION_ID,
         "contactId": contact_id,
         "type": "SMS",
         "message": message,
     }
-
-    logger.info(f"Sending SMS via Conversations API: {payload}")
-
+    logger.info("Sending SMS via Conversations API: %s", payload)
     try:
-        resp = requests.post(GHL_CONVERSATIONS_URL, headers=headers, json=payload)
+        resp = requests.post(CONVERSATIONS_URL, headers=_ghl_headers(), json=payload, timeout=10)
+        if resp.status_code == 201:
+            logger.info("SMS send OK (201): %s", resp.text)
+        else:
+            logger.error("SMS send failed (%s): %s", resp.status_code, resp.text)
     except Exception as e:
-        logger.error(f"SMS send exception: {e}")
-        return False
-
-    # 200/201 are both success. GHL returns 201 Created with conversationId/messageId.
-    if resp.status_code in (200, 201):
-        logger.info(f"SMS send OK ({resp.status_code}): {resp.text}")
-        return True
-    else:
-        logger.error(f"SMS send failed ({resp.status_code}): {resp.text}")
-        return False
+        logger.error("SMS send exception: %s", e)
 
 
-# ---------------------------
-# DISPATCH ENDPOINT (BOOKING → SEND JOB TO CONTRACTORS)
-# ---------------------------
-@app.post("/dispatch")
-async def dispatch(request: Request):
-    payload = await request.json()
-    logger.info(f"Received payload from GHL: {payload}")
-
-    # Calendar info
-    calendar = payload.get("calendar", {})
-    job_id = calendar.get("appointmentId") or calendar.get("id")
-    start_time = calendar.get("startTime")
-    end_time = calendar.get("endTime")
-
-    # Customer identity
-    first_name = (payload.get("first_name") or "").strip()
-    last_name = (payload.get("last_name") or "").strip()
-    full_name = payload.get("full_name") or f"{first_name} {last_name}".strip()
-    customer_name = full_name or "Unknown"
-
+def build_job_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a normalized job summary dict from the GHL appointment / calendar payload.
+    """
+    calendar = payload.get("calendar") or {}
     contact_id = payload.get("contact_id")
-    # We don't text customer from here yet, but we keep the info
-    # phone = payload.get("phone")
+    full_name = payload.get("full_name") or (
+        (payload.get("first_name") or "") + " " + (payload.get("last_name") or "")
+    ).strip()
 
-    # Service type (normalize to something clean; default standard)
-    raw_service = (
-        payload.get("Service Type")
-        or payload.get("Service Needed")
-        or "Standard Home Cleaning"
-    )
-    service_type = raw_service
+    price_breakdown = payload.get("Price Breakdown (Contact)") or ""
+    estimated_price = 0.0
+    # Very simple parse: look for 'Total: $99' or 'Total: 99'
+    for line in price_breakdown.splitlines():
+        if "Total:" in line:
+            try:
+                part = line.split("Total:")[-1].strip().replace("$", "")
+                estimated_price = float(part)
+            except Exception:
+                pass
 
-    estimated_price = extract_estimated_price(payload)
+    service_type = "Standard Home Cleaning"
+    if "Deep" in price_breakdown:
+        service_type = "Deep Cleaning"
 
     job_summary = {
-        "job_id": job_id,
-        "customer_name": customer_name,
+        "job_id": calendar.get("appointmentId"),  # this is what we send in SMS & expect back
+        "customer_name": full_name or "Unknown",
         "contact_id": contact_id,
         "service_type": service_type,
         "estimated_price": estimated_price,
-        "start_time": start_time,
-        "end_time": end_time,
+        "start_time": calendar.get("startTime"),
+        "end_time": calendar.get("endTime"),
+    }
+    logger.info("Job summary: %s", job_summary)
+    return job_summary
+
+
+# ---------------------------------------------------------
+# Routes
+# ---------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "alloy-dispatcher"}
+
+
+@app.get("/contractors")
+def get_contractors():
+    contractors = fetch_contractors()
+    return {"ok": True, "count": len(contractors), "contractors": contractors}
+
+
+@app.get("/debug/jobs")
+def debug_jobs():
+    """
+    Simple debug endpoint to see what jobs are currently cached in memory.
+    """
+    return {
+        "ok": True,
+        "count": len(JOB_STORE),
+        "job_ids": list(JOB_STORE.keys()),
+        "jobs": JOB_STORE,
     }
 
-    logger.info(f"Job summary: {job_summary}")
 
-    # Store in in-memory job store so replies can attach to something
+@app.post("/dispatch")
+async def dispatch(request: Request):
+    """
+    Webhook from GHL when an appointment is booked (or when we manually trigger via curl).
+    1. Build a job summary and cache it in JOB_STORE (keyed by job_id / appointmentId).
+    2. Fetch eligible contractors.
+    3. Send SMS to each contractor with "Reply YES <job_id> to accept."
+    """
+    payload = await request.json()
+    logger.info("Received payload from GHL: %s", payload)
+
+    job_summary = build_job_summary(payload)
+
+    # Cache the job in memory so /contractor-reply can find it
+    job_id = job_summary.get("job_id")
     if job_id:
-        JOB_STORE[job_id] = {
-            **job_summary,
-            "status": "offered",
-        }
+        JOB_STORE[job_id] = job_summary
+        logger.info("Cached job in memory with id=%s. JOB_STORE now has %d jobs.", job_id, len(JOB_STORE))
+    else:
+        logger.warning("No job_id in job_summary; not caching this job.")
 
-    # Fetch contractors to notify
-    contractors = fetch_contractors_from_ghl()
-    logger.info(f"Contractors found: {contractors}")
+    contractors = fetch_contractors()
+    logger.info("Contractors found: %s", contractors)
 
-    # Send job offer SMS to each contractor
-    notified_ids = []
-    for c in contractors:
-        cid = c["id"]
-        contractor_name = c["name"]
-
-        msg = (
-            f"New cleaning job available:\n"
-            f"Customer: {customer_name}\n"
-            f"Service: {service_type}\n"
-            f"When: {start_time or 'TBD'}\n"
-            f"Est. price: ${estimated_price:.2f}\n\n"
-            f"Reply YES {job_id} to accept."
-            if job_id
-            else (
-                f"New cleaning job available:\n"
-                f"Customer: {customer_name}\n"
-                f"Service: {service_type}\n"
-                f"When: {start_time or 'TBD'}\n"
-                f"Est. price: ${estimated_price:.2f}\n\n"
-                "Reply YES to accept."
-            )
+    if not contractors:
+        logger.warning("No contractors available for dispatch.")
+        return JSONResponse(
+            {
+                "ok": False,
+                "reason": "no_contractors",
+                "job": job_summary,
+            }
         )
 
-        ok = send_sms_to_contact(cid, msg)
-        if ok:
-            notified_ids.append(cid)
+    # Build contractor SMS message
+    msg = (
+        f"New cleaning job available:\n"
+        f"Customer: {job_summary['customer_name']}\n"
+        f"Service: {job_summary['service_type']}\n"
+        f"When: {job_summary['start_time'] or 'TBD'}\n"
+        f"Est. price: ${job_summary['estimated_price']:.2f}\n\n"
+        f"Reply YES {job_summary['job_id']} to accept."
+    )
 
-    # Keep track of who we pinged (best effort)
-    if job_id and job_id in JOB_STORE:
-        JOB_STORE[job_id]["notified_contractors"] = notified_ids
+    notified_ids: List[str] = []
+    for c in contractors:
+        if not c.get("id"):
+            continue
+        send_conversation_sms(c["id"], msg)
+        notified_ids.append(c["id"])
 
     return JSONResponse(
         {
@@ -295,141 +225,114 @@ async def dispatch(request: Request):
     )
 
 
-# ---------------------------
-# CONTRACTOR REPLY ENDPOINT (YES → ASSIGN JOB)
-# ---------------------------
 @app.post("/contractor-reply")
 async def contractor_reply(request: Request):
     """
-    Webhook target for GHL workflow:
-    Trigger: 'Customer replied' LIMITED to contacts with contractor_cleaning tag.
-    Action: Webhook → POST to this endpoint with the full event payload.
-
-    We:
-      - Identify contractor contact_id
-      - Parse message text
-      - If it starts with YES, assign them the job
-      - Notify other contractors job is taken
-      - Optionally notify customer
+    Webhook from GHL when a *contractor* replies to the dispatch SMS.
+    Expected formats we've wired up:
+      - { "contact_id": "...", "message": "YES <job_id>" }
+    If needed, we also try to fall back to:
+      - customData.body
+      - message.body (when GHL sends a message object)
     """
     payload = await request.json()
-    logger.info(f"Received contractor reply webhook: {payload}")
+    logger.info("Received contractor reply webhook: %s", payload)
 
-    # Try to get contact_id
+    # Try multiple spots for contact_id and message_text to be robust to GHL variations
     contact_id = (
         payload.get("contact_id")
         or payload.get("contactId")
-        or (payload.get("contact") or {}).get("id")
+        or (payload.get("customData") or {}).get("contact_id")
     )
 
-    # Try to get message text from common fields
-    message_text = (
+    raw_message = (
         payload.get("message")
-        or payload.get("body")
-        or payload.get("text")
-        or payload.get("last_message")
-        or (payload.get("conversation") or {}).get("message")
-        or ""
+        or (payload.get("customData") or {}).get("body")
+        or (payload.get("message") or {}).get("body")
     )
 
-    if not contact_id:
-        logger.error("contractor-reply: missing contact_id in payload")
-        return JSONResponse({"ok": False, "reason": "missing contact_id"})
+    # Force message_text to string so .strip() always works
+    if isinstance(raw_message, dict):
+        # e.g., {"type": 2, "body": "Yes"}
+        raw_message = raw_message.get("body") or ""
+    if raw_message is None:
+        raw_message = ""
 
-    if not message_text:
-        logger.error("contractor-reply: missing message_text in payload")
-        return JSONResponse({"ok": False, "reason": "missing message_text"})
+    message_text = str(raw_message)
+    logger.info("Parsed contractor reply: contact_id=%s, message_text=%s", contact_id, message_text)
 
-    logger.info(f"Parsed contractor reply: contact_id={contact_id}, message_text={message_text}")
-
-    # Normalize
     text_stripped = message_text.strip()
-    text_upper = text_stripped.upper()
-
-    # Only treat YES as acceptance
-    if not text_upper.startswith("YES"):
-        logger.info("contractor-reply: message not an acceptance, ignoring")
-        return JSONResponse({"ok": True, "ignored": True})
-
-    # Try to parse job_id from the reply (YES <job_id>)
     parts = text_stripped.split()
-    job_id = None
-    if len(parts) >= 2:
-        job_id = parts[1].strip()
 
-    # Fallback: if no job_id in message, grab "latest offered" job in memory
-    if not job_id and JOB_STORE:
-        # last inserted key: crude but works for early phase
-        job_id = list(JOB_STORE.keys())[-1]
-        logger.info(f"contractor-reply: no job id in message, falling back to latest job {job_id}")
+    if len(parts) < 2 or parts[0].upper() != "YES":
+        logger.error("contractor-reply: invalid reply format: %s", message_text)
+        return JSONResponse(
+            {"ok": False, "reason": "invalid_format", "message_text": message_text},
+            status_code=200,
+        )
 
-    job_info = JOB_STORE.get(job_id) if job_id else None
-    if not job_info:
-        logger.error(f"contractor-reply: job not found for job_id={job_id}")
-        return JSONResponse({"ok": False, "reason": "job_not_found", "job_id": job_id})
+    job_id = parts[1]
+    job = JOB_STORE.get(job_id)
 
-    # Fetch contractors again so we can identify this contractor & others
-    contractors = fetch_contractors_from_ghl()
-    accepter = next((c for c in contractors if c["id"] == contact_id), None)
+    if not job:
+        logger.error(
+            "contractor-reply: job not found for job_id=%s. Known job_ids=%s",
+            job_id,
+            list(JOB_STORE.keys()),
+        )
+        return JSONResponse(
+            {"ok": False, "reason": "job_not_found", "job_id": job_id},
+            status_code=200,
+        )
 
-    if not accepter:
-        logger.error(f"contractor-reply: contractor {contact_id} not found in GHL")
-        return JSONResponse({"ok": False, "reason": "contractor_not_found"})
+    # Lookup contractor info (mainly for name in logs / notifications)
+    contractors = fetch_contractors()
+    contractor = next((c for c in contractors if c.get("id") == contact_id), None)
 
-    # Mark in memory as assigned
-    job_info["status"] = "assigned"
-    job_info["assigned_contractor_id"] = contact_id
-    job_info["assigned_contractor_name"] = accepter["name"]
-    JOB_STORE[job_id] = job_info
+    contractor_name = contractor.get("name") if contractor else "Unknown contractor"
 
-    customer_name = job_info.get("customer_name")
-    start_time = job_info.get("start_time")
-    est_price = job_info.get("estimated_price", 0.0)
-
-    # 1) Confirm to accepting contractor
-    contractor_confirm_msg = (
+    # 1) Confirm to the accepting contractor
+    confirm_msg = (
         f"You accepted this job:\n"
-        f"Customer: {customer_name}\n"
-        f"When: {start_time}\n"
-        f"Est. price: ${est_price:.2f}\n\n"
-        f"We'll share final details in your Alloy dashboard."
+        f"Customer: {job['customer_name']}\n"
+        f"When: {job['start_time']}\n"
+        f"Est. price: ${job['estimated_price']:.2f}\n\n"
+        f\"We'll share final details in your Alloy dashboard.\"
     )
-    send_sms_to_contact(contact_id, contractor_confirm_msg)
+    if contact_id:
+        send_conversation_sms(contact_id, confirm_msg)
 
-    # 2) Notify other contractors that job is taken
-    notified_ids = job_info.get("notified_contractors") or [c["id"] for c in contractors]
-    taken_msg = (
-        f"Job for {customer_name} on {start_time} has been claimed by another contractor."
-    )
-
+    # 2) Notify all other contractors that the job was claimed
     for c in contractors:
-        cid = c["id"]
-        if cid == contact_id:
+        cid = c.get("id")
+        if not cid or cid == contact_id:
             continue
-        if cid not in notified_ids:
-            # They might not have actually been notified; we can skip or include.
-            # Early phase: we can still notify them; no harm.
-            pass
-        send_sms_to_contact(cid, taken_msg)
+        send_conversation_sms(
+            cid,
+            f"Job for {job['customer_name']} on {job['start_time']} has been claimed by another contractor.",
+        )
 
-    # 3) Notify customer (if we have their contact_id)
-    customer_contact_id = job_info.get("contact_id")
+    # 3) Notify the customer their job has been assigned (if we have their contact_id)
+    customer_contact_id = job.get("contact_id")
     if customer_contact_id:
         customer_msg = (
-            f"Your cleaning on {start_time} has been assigned to one of our partner teams. "
+            f"Your cleaning on {job['start_time']} has been assigned to one of our partner teams. "
             f"They will contact you before arrival."
         )
-        send_sms_to_contact(customer_contact_id, customer_msg)
+        send_conversation_sms(customer_contact_id, customer_msg)
 
     logger.info(
-        f"contractor-reply: job {job_id} assigned to contractor {contact_id} ({accepter['name']})"
+        "contractor-reply: job %s assigned to contractor %s (%s)",
+        job_id,
+        contact_id,
+        contractor_name,
     )
 
     return JSONResponse(
         {
             "ok": True,
             "job_id": job_id,
-            "assigned_to": contact_id,
-            "assigned_contractor_name": accepter["name"],
+            "contractor_id": contact_id,
+            "contractor_name": contractor_name,
         }
     )
