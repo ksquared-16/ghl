@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Request
@@ -17,12 +17,23 @@ GHL_API_KEY = os.getenv("GHL_API_KEY")
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "ZO1DxVJw65kU2EbHpHLq")
 
 LC_BASE_URL = "https://services.leadconnectorhq.com"
-
 CONTACTS_URL = f"{LC_BASE_URL}/contacts/"
 CONVERSATIONS_URL = f"{LC_BASE_URL}/conversations/messages"
 JOBS_OBJECT_URL = f"{LC_BASE_URL}/objects/jobs/records"
 
 # In-memory job store: { job_id (appointmentId): job_summary_dict }
+# job_summary shape:
+# {
+#   "job_id": str,
+#   "customer_name": str,
+#   "contact_id": str,
+#   "service_type": str,
+#   "estimated_price": float,
+#   "start_time": str,
+#   "end_time": str,
+#   "notified_contractors": [str, ...],
+#   "assigned_contractor_id": Optional[str],
+# }
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI()
@@ -33,15 +44,10 @@ app = FastAPI()
 # ---------------------------------------------------------
 
 def _ghl_headers() -> Dict[str, str]:
-    """
-    Base headers for all GHL / LeadConnector API calls.
-    NOTE: For Custom Objects, LocationId header is REQUIRED.
-    """
     return {
         "Authorization": f"Bearer {GHL_API_KEY}",
         "Version": "2021-07-28",
         "Content-Type": "application/json",
-        "LocationId": GHL_LOCATION_ID,  # 👈 critical for objects API
     }
 
 
@@ -132,27 +138,31 @@ def build_job_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         service_type = "Deep Cleaning"
 
     job_summary = {
-        "job_id": calendar.get("appointmentId"),  # this is what we send in SMS & expect back
+        "job_id": calendar.get("appointmentId"),  # this is what we send in SMS & expect back (or infer)
         "customer_name": full_name or "Unknown",
         "contact_id": contact_id,
         "service_type": service_type,
         "estimated_price": estimated_price,
         "start_time": calendar.get("startTime"),
         "end_time": calendar.get("endTime"),
+        # these get filled in at dispatch time
+        "notified_contractors": [],
+        "assigned_contractor_id": None,
     }
     logger.info("Job summary: %s", job_summary)
     return job_summary
 
 
-def upsert_job_assignment(job_id: str, contractor_id: str, contractor_name: str) -> None:
+def update_job_object(job_id: str, contractor_id: str, contractor_name: str) -> None:
     """
-    Upsert the Jobs custom object record based on external_job_id (job_id).
-    We set:
-      - external_job_id
-      - contractor_assigned_id
-      - contractor_assigned_name
-      - job_status = 'assigned'
+    Upsert into the Jobs custom object in GHL, keyed by external_job_id.
+    This is where we were failing with 'LocationId is not specified'.
+    Fix: send LocationId both as header and query param.
     """
+    if not job_id or not contractor_id:
+        logger.warning("update_job_object: missing job_id or contractor_id, skipping. job_id=%s, contractor_id=%s", job_id, contractor_id)
+        return
+
     payload = {
         "uniqueField": "external_job_id",
         "uniqueValue": job_id,
@@ -164,30 +174,33 @@ def upsert_job_assignment(job_id: str, contractor_id: str, contractor_name: str)
         },
     }
 
+    headers = _ghl_headers()
+    # IMPORTANT: objects API wants LocationId explicitly
+    headers["LocationId"] = GHL_LOCATION_ID
+
     logger.info(
         "Updating Jobs object on assignment via %s with payload: %s",
         JOBS_OBJECT_URL,
         payload,
     )
-
     try:
-        resp = requests.post(JOBS_OBJECT_URL, headers=_ghl_headers(), json=payload, timeout=10)
+        resp = requests.post(
+            JOBS_OBJECT_URL,
+            headers=headers,
+            params={"locationId": GHL_LOCATION_ID},
+            json=payload,
+            timeout=10,
+        )
+        if resp.ok:
+            logger.info("Jobs object assignment upsert OK (%s): %s", resp.status_code, resp.text)
+        else:
+            logger.error(
+                "Jobs object assignment upsert failed (%s): %s",
+                resp.status_code,
+                resp.text,
+            )
     except Exception as e:
         logger.error("Jobs object assignment upsert exception: %s", e)
-        return
-
-    if not resp.ok:
-        logger.error(
-            "Jobs object assignment upsert failed (%s): %s",
-            resp.status_code,
-            resp.text,
-        )
-    else:
-        logger.info(
-            "Jobs object assignment upsert OK (%s): %s",
-            resp.status_code,
-            resp.text,
-        )
 
 
 # ---------------------------------------------------------
@@ -222,22 +235,17 @@ def debug_jobs():
 async def dispatch(request: Request):
     """
     Webhook from GHL when an appointment is booked (or when we manually trigger via curl).
-    1. Build a job summary and cache it in JOB_STORE (keyed by job_id / appointmentId).
+    1. Build a job summary.
     2. Fetch eligible contractors.
     3. Send SMS to each contractor with "Reply YES <job_id> to accept."
+       (plus support plain 'YES' by tracking notified_contractors).
+    4. Cache the job summary in JOB_STORE with notified_contractors + assigned_contractor_id.
     """
     payload = await request.json()
     logger.info("Received payload from GHL: %s", payload)
 
     job_summary = build_job_summary(payload)
-
-    # Cache the job in memory so /contractor-reply can find it
     job_id = job_summary.get("job_id")
-    if job_id:
-        JOB_STORE[job_id] = job_summary
-        logger.info("Cached job in memory with id=%s. JOB_STORE now has %d jobs.", job_id, len(JOB_STORE))
-    else:
-        logger.warning("No job_id in job_summary; not caching this job.")
 
     contractors = fetch_contractors()
     logger.info("Contractors found: %s", contractors)
@@ -252,7 +260,6 @@ async def dispatch(request: Request):
             }
         )
 
-    # Build contractor SMS message
     msg = (
         f"New cleaning job available:\n"
         f"Customer: {job_summary['customer_name']}\n"
@@ -269,6 +276,20 @@ async def dispatch(request: Request):
         send_conversation_sms(c["id"], msg)
         notified_ids.append(c["id"])
 
+    # track who we sent this job to, and that it's still unassigned
+    job_summary["notified_contractors"] = notified_ids
+    job_summary["assigned_contractor_id"] = None
+
+    if job_id:
+        JOB_STORE[job_id] = job_summary
+        logger.info(
+            "Cached job in memory with id=%s. JOB_STORE now has %d jobs.",
+            job_id,
+            len(JOB_STORE),
+        )
+    else:
+        logger.warning("No job_id in job_summary; not caching this job.")
+
     return JSONResponse(
         {
             "ok": True,
@@ -282,11 +303,13 @@ async def dispatch(request: Request):
 async def contractor_reply(request: Request):
     """
     Webhook from GHL when a *contractor* replies to the dispatch SMS.
-    Expected formats we've wired up:
-      - { "contact_id": "...", "message": "YES <job_id>" }
-    If needed, we also try to fall back to:
-      - customData.body
-      - message.body (when GHL sends a message object)
+
+    Supported formats now:
+      1) "YES <job_id>"  (what we've been using in tests)
+      2) "YES"           (plain yes – real-world contractor behavior)
+
+    For (2), we infer the job by finding the most recent unassigned job in JOB_STORE
+    that was sent to this contractor (contact_id ∈ notified_contractors).
     """
     payload = await request.json()
     logger.info("Received contractor reply webhook: %s", payload)
@@ -317,26 +340,78 @@ async def contractor_reply(request: Request):
     text_stripped = message_text.strip()
     parts = text_stripped.split()
 
-    if len(parts) < 2 or parts[0].upper() != "YES":
+    job_id: Optional[str] = None
+    job: Optional[Dict[str, Any]] = None
+
+    # Case 1: "YES <job_id>"
+    if len(parts) >= 2 and parts[0].upper() == "YES":
+        job_id = parts[1]
+        job = JOB_STORE.get(job_id)
+        if not job:
+            logger.error(
+                "contractor-reply: job not found for job_id=%s. Known job_ids=%s",
+                job_id,
+                list(JOB_STORE.keys()),
+            )
+            return JSONResponse(
+                {"ok": False, "reason": "job_not_found", "job_id": job_id},
+                status_code=200,
+            )
+
+    # Case 2: plain "YES" / "Y" — infer job based on contractor + open jobs
+    elif text_stripped.upper() in ("Y", "YES"):
+        if not contact_id:
+            logger.error("contractor-reply: plain YES but no contact_id, cannot infer job.")
+            return JSONResponse(
+                {"ok": False, "reason": "no_contact_id_for_plain_yes"},
+                status_code=200,
+            )
+
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        for jid, j in JOB_STORE.items():
+            notified = j.get("notified_contractors") or []
+            assigned = j.get("assigned_contractor_id")
+            if contact_id in notified and not assigned:
+                candidates.append((jid, j))
+
+        if not candidates:
+            logger.error(
+                "contractor-reply: no open job found for contractor_id=%s. JOB_STORE keys=%s",
+                contact_id,
+                list(JOB_STORE.keys()),
+            )
+            return JSONResponse(
+                {"ok": False, "reason": "no_open_job_for_contractor"},
+                status_code=200,
+            )
+
+        # At your current volume, this should almost always be 1.
+        # If multiple, we take the last one (most recently inserted).
+        job_id, job = candidates[-1]
+        logger.info(
+            "contractor-reply: inferred job_id=%s for contractor_id=%s based on notified_contractors",
+            job_id,
+            contact_id,
+        )
+
+    else:
         logger.error("contractor-reply: invalid reply format: %s", message_text)
         return JSONResponse(
             {"ok": False, "reason": "invalid_format", "message_text": message_text},
             status_code=200,
         )
 
-    job_id = parts[1]
-    job = JOB_STORE.get(job_id)
-
-    if not job:
-        logger.error(
-            "contractor-reply: job not found for job_id=%s. Known job_ids=%s",
-            job_id,
-            list(JOB_STORE.keys()),
-        )
+    # Safety check
+    if not job or not job_id:
+        logger.error("contractor-reply: resolved job is None after parsing. message_text=%s", message_text)
         return JSONResponse(
-            {"ok": False, "reason": "job_not_found", "job_id": job_id},
+            {"ok": False, "reason": "job_resolution_failed"},
             status_code=200,
         )
+
+    # Mark in memory that this job is now assigned to this contractor
+    job["assigned_contractor_id"] = contact_id
+    JOB_STORE[job_id] = job
 
     # Lookup contractor info (mainly for name in logs / notifications)
     contractors = fetch_contractors()
@@ -374,9 +449,8 @@ async def contractor_reply(request: Request):
         )
         send_conversation_sms(customer_contact_id, customer_msg)
 
-    # 4) Update Jobs custom object with assignment
-    if job_id and contact_id:
-        upsert_job_assignment(job_id, contact_id, contractor_name)
+    # 4) Update the Jobs custom object in GHL
+    update_job_object(job_id, contact_id or "", contractor_name)
 
     logger.info(
         "contractor-reply: job %s assigned to contractor %s (%s)",
