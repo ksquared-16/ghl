@@ -15,11 +15,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alloy-dispatcher")
 
 GHL_API_KEY = os.getenv("GHL_API_KEY")
-GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")  # no hard-coded default
+GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
 
 LC_BASE_URL = "https://services.leadconnectorhq.com"
 CONTACTS_URL = f"{LC_BASE_URL}/contacts/"
 CONVERSATIONS_URL = f"{LC_BASE_URL}/conversations/messages"
+JOBS_RECORDS_URL = f"{LC_BASE_URL}/objects/custom_objects.jobs/records"
+JOBS_SEARCH_URL = f"{LC_BASE_URL}/objects/custom_objects.jobs/records/search"
 
 # In-memory job store: { job_id (appointmentId): job_summary_dict }
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
@@ -35,8 +37,8 @@ def _ghl_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {GHL_API_KEY}",
         "Version": "2021-07-28",
-        "Content-Type": "application/json",
         "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
 
@@ -44,8 +46,11 @@ def fetch_contractors() -> List[Dict[str, Any]]:
     """
     Fetch contractors from GHL contacts API, filtered by tags.
     Currently: contractor_cleaning + job-pending-assignment.
-    Only keep ones with a phone number.
     """
+    if not GHL_LOCATION_ID:
+        logger.error("GHL_LOCATION_ID is not set; cannot fetch contractors.")
+        return []
+
     params = {
         "locationId": GHL_LOCATION_ID,
         "limit": 50,
@@ -66,23 +71,13 @@ def fetch_contractors() -> List[Dict[str, Any]]:
 
     for c in contacts:
         tags = c.get("tags") or []
-        phone = c.get("phone")
-        cid = c.get("id")
-
         if "contractor_cleaning" in tags and "job-pending-assignment" in tags:
-            if not cid or not phone:
-                logger.info(
-                    "Skipping contractor without valid id/phone: id=%s phone=%s",
-                    cid,
-                    phone,
-                )
-                continue
-
             contractors.append(
                 {
-                    "id": cid,
-                    "name": c.get("contactName") or f"{c.get('firstName', '')} {c.get('lastName', '')}".strip(),
-                    "phone": phone,
+                    "id": c.get("id"),
+                    "name": c.get("contactName")
+                    or f"{c.get('firstName', '')} {c.get('lastName', '')}".strip(),
+                    "phone": c.get("phone"),
                     "tags": tags,
                     "contact_source": c.get("source") or "",
                 }
@@ -95,7 +90,12 @@ def fetch_contractors() -> List[Dict[str, Any]]:
 def send_conversation_sms(contact_id: str, message: str) -> None:
     """
     Send an SMS via GHL Conversations API.
+    NOTE: GHL requires the contact to have a phone number on file.
     """
+    if not GHL_LOCATION_ID:
+        logger.error("GHL_LOCATION_ID is not set; cannot send SMS.")
+        return
+
     payload = {
         "locationId": GHL_LOCATION_ID,
         "contactId": contact_id,
@@ -151,80 +151,138 @@ def build_job_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     return job_summary
 
 
-def update_job_record_direct(
-    job_record_id: str,
-    contractor_id: str,
-    contractor_name: str,
-    job_status: str = "contractor_assigned",
-) -> Optional[Dict[str, Any]]:
+def find_job_record_id(external_job_id: str) -> Optional[str]:
     """
-    Update a Jobs custom object record using the exact pattern that works in ghl_update_test.py:
-
-        PUT /objects/custom_objects.jobs/records/{job_record_id}?locationId=...
-
-    Body:
-        {
-          "properties": {
-            "contractor_assigned_id": ...,
-            "contractor_assigned_name": ...,
-            "job_status": ...
-          }
-        }
+    Lookup the Jobs custom object record id using external_job_id.
+    Uses POST /objects/custom_objects.jobs/records/search.
     """
-    if not GHL_API_KEY or not GHL_LOCATION_ID:
-        logger.error("GHL_API_KEY or GHL_LOCATION_ID is missing; cannot update job record.")
+    if not external_job_id:
+        return None
+    if not GHL_LOCATION_ID:
+        logger.error("find_job_record_id: GHL_LOCATION_ID not set")
         return None
 
-    if not job_record_id:
-        logger.error("update_job_record_direct: job_record_id is required.")
+    body = {
+        "locationId": GHL_LOCATION_ID,
+        "page": 1,
+        "pageLimit": 1,
+        "filters": [
+            {
+                "group": "AND",
+                "filters": [
+                    {
+                        "group": "AND",
+                        "filters": [
+                            {
+                                "field": "properties.external_job_id",
+                                "operator": "eq",
+                                "value": external_job_id,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    try:
+        logger.info("Searching job record id for external_job_id=%s", external_job_id)
+        resp = requests.post(JOBS_SEARCH_URL, headers=_ghl_headers(), json=body, timeout=10)
+    except Exception as e:
+        logger.error("find_job_record_id: exception: %s", e)
         return None
 
-    url = f"{LC_BASE_URL}/objects/custom_objects.jobs/records/{job_record_id}"
-    params = {"locationId": GHL_LOCATION_ID}
+    if not resp.ok:
+        logger.error(
+            "find_job_record_id: search failed (%s): %s", resp.status_code, resp.text
+        )
+        return None
+
+    data = resp.json()
+    # Your actual response has "records"
+    records = data.get("records") or data.get("customObjectRecords") or []
+    if not records:
+        logger.error(
+            "find_job_record_id: no records found for external_job_id=%s",
+            external_job_id,
+        )
+        return None
+
+    record_id = records[0].get("id")
+    logger.info(
+        "find_job_record_id: found record_id=%s for external_job_id=%s",
+        record_id,
+        external_job_id,
+    )
+    return record_id
+
+
+def upsert_job_assignment_to_ghl(job_id: str, contractor_id: str, contractor_name: str) -> None:
+    """
+    Update assignment details into the Jobs custom object in GHL.
+
+    1. Find record id via /objects/custom_objects.jobs/records/search using external_job_id.
+    2. PUT /objects/custom_objects.jobs/records/{id}?locationId=...
+       with properties { contractor_assigned_id, contractor_assigned_name, job_status }.
+    """
+    if not job_id or not contractor_id:
+        logger.warning(
+            "upsert_job_assignment_to_ghl: missing job_id or contractor_id, skipping. "
+            "job_id=%s contractor_id=%s",
+            job_id,
+            contractor_id,
+        )
+        return
+    if not GHL_LOCATION_ID:
+        logger.error("upsert_job_assignment_to_ghl: GHL_LOCATION_ID not set")
+        return
+
+    record_id = find_job_record_id(job_id)
+    if not record_id:
+        logger.error(
+            "upsert_job_assignment_to_ghl: could not find job record for external_job_id=%s",
+            job_id,
+        )
+        return
 
     payload = {
         "properties": {
+            "external_job_id": job_id,
             "contractor_assigned_id": contractor_id,
             "contractor_assigned_name": contractor_name,
-            "job_status": job_status,
+            "job_status": "contractor_assigned",
         }
     }
+    params = {"locationId": GHL_LOCATION_ID}
 
     logger.info(
-        "Updating Jobs record via PUT %s params=%s payload=%s",
-        url,
+        "Updating Jobs object on assignment via %s/%s with params %s and payload: %s",
+        JOBS_RECORDS_URL,
+        record_id,
         params,
         payload,
     )
 
     try:
         resp = requests.put(
-            url,
+            f"{JOBS_RECORDS_URL}/{record_id}",
             headers=_ghl_headers(),
             params=params,
             json=payload,
-            timeout=15,
+            timeout=10,
         )
     except Exception as e:
-        logger.error("update_job_record_direct: exception calling GHL: %s", e)
-        return None
+        logger.error("Jobs object assignment upsert exception: %s", e)
+        return
 
-    if not resp.ok:
+    if resp.ok:
+        logger.info("Jobs object assignment upsert OK: %s", resp.text)
+    else:
         logger.error(
-            "update_job_record_direct: GHL returned %s: %s",
+            "Jobs object assignment upsert failed (%s): %s",
             resp.status_code,
             resp.text,
         )
-        return None
-
-    try:
-        data = resp.json()
-    except Exception:
-        logger.error("update_job_record_direct: could not parse JSON response: %s", resp.text)
-        return None
-
-    logger.info("update_job_record_direct: success: %s", data)
-    return data
 
 
 # ---------------------------------------------------------
@@ -260,23 +318,13 @@ async def dispatch(request: Request):
     """
     Webhook from GHL when an appointment is booked.
     1. Build a job summary and cache it in JOB_STORE (keyed by job_id / appointmentId).
-    2. Optionally store job_record_id if provided in customData.
-    3. Fetch eligible contractors.
-    4. Send SMS to each contractor with "Reply YES <job_id> to accept."
+    2. Fetch eligible contractors.
+    3. Send SMS to each contractor with "Reply YES <job_id> to accept."
     """
     payload = await request.json()
     logger.info("Received payload from GHL: %s", payload)
 
     job_summary = build_job_summary(payload)
-
-    # get job_record_id from customData if you mapped it in the workflow webhook
-    custom = payload.get("customData") or {}
-    job_record_id = custom.get("job_record_id")
-    if isinstance(job_record_id, str):
-        job_record_id = job_record_id.strip() or None
-    if job_record_id:
-        job_summary["job_record_id"] = job_record_id
-        logger.info("Captured job_record_id on dispatch: %s", job_record_id)
 
     # enrich with dispatch metadata
     job_summary.setdefault("notified_contractors", [])
@@ -288,7 +336,11 @@ async def dispatch(request: Request):
     job_id = job_summary.get("job_id")
     if job_id:
         JOB_STORE[job_id] = job_summary
-        logger.info("Cached job in memory with id=%s. JOB_STORE now has %d jobs.", job_id, len(JOB_STORE))
+        logger.info(
+            "Cached job in memory with id=%s. JOB_STORE now has %d jobs.",
+            job_id,
+            len(JOB_STORE),
+        )
     else:
         logger.warning("No job_id in job_summary; not caching this job.")
 
@@ -317,11 +369,18 @@ async def dispatch(request: Request):
 
     notified_ids: List[str] = []
     for c in contractors:
-        if not c.get("id"):
+        cid = c.get("id")
+        phone = c.get("phone")
+        if not cid or not phone:
+            logger.info(
+                "Skipping contractor without valid id/phone: id=%s phone=%s",
+                cid,
+                phone,
+            )
             continue
-        send_conversation_sms(c["id"], msg)
-        notified_ids.append(c["id"])
-        job_summary["notified_contractors"].append(c["id"])
+        send_conversation_sms(cid, msg)
+        notified_ids.append(cid)
+        job_summary["notified_contractors"].append(cid)
 
     return JSONResponse(
         {
@@ -354,7 +413,9 @@ async def contractor_reply(request: Request):
 
     # Prefer customData.body, then message.body, then raw message string
     message_obj = payload.get("message") or {}
-    raw_message = custom.get("body") or message_obj.get("body") or payload.get("message")
+    raw_message = custom.get("body") or message_obj.get("body") or payload.get(
+        "message"
+    )
 
     # Normalize raw_message -> string
     if isinstance(raw_message, dict):
@@ -363,7 +424,11 @@ async def contractor_reply(request: Request):
         raw_message = ""
 
     message_text = str(raw_message)
-    logger.info("Parsed contractor reply: contact_id=%s, message_text=%s", contact_id, message_text)
+    logger.info(
+        "Parsed contractor reply: contact_id=%s, message_text=%s",
+        contact_id,
+        message_text,
+    )
 
     text_stripped = message_text.strip()
     text_upper = text_stripped.upper()
@@ -387,9 +452,15 @@ async def contractor_reply(request: Request):
     # If no job yet, but it's a YES/Y reply, fall back to latest job
     if not job:
         if text_upper not in ("YES", "Y", "YEA", "YEAH", "YEP"):
-            logger.error("contractor-reply: invalid reply format: %s", message_text)
+            logger.error(
+                "contractor-reply: invalid reply format: %s", message_text
+            )
             return JSONResponse(
-                {"ok": False, "reason": "invalid_format", "message_text": message_text},
+                {
+                    "ok": False,
+                    "reason": "invalid_format",
+                    "message_text": message_text,
+                },
                 status_code=200,
             )
 
@@ -406,7 +477,11 @@ async def contractor_reply(request: Request):
                 list(JOB_STORE.keys()),
             )
             return JSONResponse(
-                {"ok": False, "reason": "job_not_found_for_contractor", "contact_id": contact_id},
+                {
+                    "ok": False,
+                    "reason": "job_not_found_for_contractor",
+                    "contact_id": contact_id,
+                },
                 status_code=200,
             )
 
@@ -449,7 +524,14 @@ async def contractor_reply(request: Request):
     # 2) Notify all other contractors that the job was claimed
     for c in contractors:
         cid = c.get("id")
-        if not cid or cid == contact_id:
+        phone = c.get("phone")
+        if not cid or not phone or cid == contact_id:
+            if not cid or not phone:
+                logger.info(
+                    "Skipping contractor without valid id/phone: id=%s phone=%s",
+                    cid,
+                    phone,
+                )
             continue
         send_conversation_sms(
             cid,
@@ -465,20 +547,8 @@ async def contractor_reply(request: Request):
         )
         send_conversation_sms(customer_contact_id, customer_msg)
 
-    # 4) Push assignment into Jobs object USING job_record_id
-    job_record_id = job.get("job_record_id") or custom.get("job_record_id")
-    if not job_record_id:
-        logger.error(
-            "contractor-reply: job_record_id missing; cannot update Jobs record. job_id=%s",
-            job_id,
-        )
-    else:
-        update_job_record_direct(
-            job_record_id=job_record_id,
-            contractor_id=contact_id or "",
-            contractor_name=contractor_name or "",
-            job_status="contractor_assigned",
-        )
+    # 4) Push assignment into Jobs object (custom_objects.jobs)
+    upsert_job_assignment_to_ghl(job_id, contact_id or "", contractor_name or "")
 
     logger.info(
         "contractor-reply: job %s assigned to contractor %s (%s)",
