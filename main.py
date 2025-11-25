@@ -27,7 +27,7 @@ LC_BASE_URL = "https://services.leadconnectorhq.com"
 CONTACTS_URL = f"{LC_BASE_URL}/contacts/"
 CONVERSATIONS_URL = f"{LC_BASE_URL}/conversations/messages"
 
-# Jobs custom object base URL (list + create + record-level ops)
+# Jobs custom object base URL (records)
 JOBS_RECORDS_URL = f"{LC_BASE_URL}/objects/custom_objects.jobs/records"
 
 # In-memory job store: { job_id (appointmentId): job_summary_dict }
@@ -91,7 +91,6 @@ def fetch_contractors() -> List[Dict[str, Any]]:
 def send_conversation_sms(contact_id: str, message: str) -> None:
     """
     Send an SMS via GHL Conversations API.
-    NOTE: Caller should ensure the contact has a phone number; otherwise GHL returns 422.
     """
     payload = {
         "locationId": GHL_LOCATION_ID,
@@ -149,121 +148,53 @@ def build_job_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     return job_summary
 
 
-def find_job_record_id(job_id: str) -> Optional[str]:
-    """
-    Look up the Jobs custom object record id by external_job_id.
-    We then use that id in a PUT call that matches the working curl.
-    """
-    params = {
-        "locationId": GHL_LOCATION_ID,
-        "limit": 100,
-    }
-    logger.info("Looking up job record id for external_job_id=%s", job_id)
-
-    try:
-        resp = requests.get(
-            JOBS_RECORDS_URL,
-            headers=_ghl_headers(),
-            params=params,
-            timeout=10,
-        )
-    except Exception as e:
-        logger.error("find_job_record_id: exception fetching jobs records: %s", e)
-        return None
-
-    if not resp.ok:
-        logger.error(
-            "find_job_record_id: fetch failed (%s): %s",
-            resp.status_code,
-            resp.text,
-        )
-        return None
-
-    data = resp.json()
-    # Try common response shapes: {"records":[...]}, {"data":[...]}, {"items":[...]}
-    records = []
-    if isinstance(data, dict):
-        if isinstance(data.get("records"), list):
-            records = data["records"]
-        elif isinstance(data.get("data"), list):
-            records = data["data"]
-        elif isinstance(data.get("items"), list):
-            records = data["items"]
-
-    for rec in records:
-        props = rec.get("properties") or {}
-        if props.get("external_job_id") == job_id:
-            rec_id = rec.get("id")
-            logger.info("Matched external_job_id=%s to record id=%s", job_id, rec_id)
-            return rec_id
-
-    logger.error(
-        "find_job_record_id: no record found for external_job_id=%s; top-level keys=%s",
-        job_id,
-        list(data.keys()) if isinstance(data, dict) else type(data),
-    )
-    return None
-
-
 def upsert_job_assignment_to_ghl(job_id: str, contractor_id: str, contractor_name: str) -> None:
     """
-    Update the Jobs custom object in GHL to reflect the assigned contractor.
-
-    IMPLEMENTATION:
-      1) Find the record id for this external_job_id
-      2) PUT /objects/custom_objects.jobs/records/{recordId}?locationId=...
-         with the same JSON structure as your working curl.
+    Upsert assignment details into the Jobs custom object in GHL,
+    keyed by external_job_id (which we're using as the appointmentId).
     """
     if not job_id or not contractor_id:
         logger.warning("upsert_job_assignment_to_ghl: missing job_id or contractor_id, skipping")
         return
 
-    record_id = find_job_record_id(job_id)
-    if not record_id:
-        logger.error(
-            "upsert_job_assignment_to_ghl: could not find job record for external_job_id=%s",
-            job_id,
-        )
-        return
-
-    url = f"{JOBS_RECORDS_URL}/{record_id}"
-
-    # Match the WORKING curl exactly:
-    # curl -X PUT ".../objects/custom_objects.jobs/records/$JOB_RECORD_ID?locationId=$LOCATION_ID" \
-    #   -d '{"properties": {"contractor_assigned_id": "...", "contractor_assigned_name": "...", "job_status": "contractor_assigned"}}'
     payload = {
+        "uniqueField": "external_job_id",
+        "uniqueValue": job_id,
         "properties": {
+            "external_job_id": job_id,
             "contractor_assigned_id": contractor_id,
             "contractor_assigned_name": contractor_name,
+            # Must match your SINGLE_OPTIONS keys:
+            # pending_assignment, assigned, contractor_assigned, in_progress, completed, cancelled
             "job_status": "contractor_assigned",
-        }
+        },
     }
 
     logger.info(
-        "Updating Jobs object via PUT %s with params locationId=%s and payload: %s",
-        url,
+        "Updating Jobs object on assignment via %s with params locationId=%s and payload: %s",
+        JOBS_RECORDS_URL,
         GHL_LOCATION_ID,
         payload,
     )
 
     try:
-        resp = requests.put(
-            url,
+        resp = requests.post(
+            JOBS_RECORDS_URL,
             headers=_ghl_headers(),
             params={"locationId": GHL_LOCATION_ID},
             json=payload,
             timeout=10,
         )
         if resp.ok:
-            logger.info("Jobs object assignment update OK: %s", resp.text)
+            logger.info("Jobs object assignment upsert OK: %s", resp.text)
         else:
             logger.error(
-                "Jobs object assignment update failed (%s): %s",
+                "Jobs object assignment upsert failed (%s): %s",
                 resp.status_code,
                 resp.text,
             )
     except Exception as e:
-        logger.error("Jobs object assignment update exception: %s", e)
+        logger.error("Jobs object assignment upsert exception: %s", e)
 
 
 # ---------------------------------------------------------
@@ -346,7 +277,6 @@ async def dispatch(request: Request):
 
     notified_ids: List[str] = []
     for c in contractors:
-        # Skip contractors without id or phone to avoid 422 "Missing phone number"
         if not c.get("id") or not c.get("phone"):
             logger.info(
                 "Skipping contractor without valid id/phone: id=%s phone=%s",
