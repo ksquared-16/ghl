@@ -154,8 +154,10 @@ def upsert_job_assignment_to_ghl(job_id: str, contractor_id: str, contractor_nam
     Upsert assignment details into the Jobs custom object in GHL,
     keyed by external_job_id (which we're using as the unique job_id from the calendar).
 
-    IMPORTANT: This endpoint should NOT include locationId as a query param or body field.
-    Location is inferred from the API key.
+    This mirrors the working curl:
+    PUT https://services.leadconnectorhq.com/objects/custom_objects.jobs/records/{recordId}?locationId=...
+    but uses the POST upsert-by-uniqueField variant:
+    POST /objects/custom_objects.jobs/records?locationId=...
     """
     if not job_id or not contractor_id:
         logger.warning("upsert_job_assignment_to_ghl: missing job_id or contractor_id, skipping")
@@ -165,25 +167,30 @@ def upsert_job_assignment_to_ghl(job_id: str, contractor_id: str, contractor_nam
         "uniqueField": "external_job_id",
         "uniqueValue": job_id,
         "properties": {
+            # You can omit external_job_id here if you want to match your curl exactly,
+            # but including it is safe and keeps the record consistent.
             "external_job_id": job_id,
             "contractor_assigned_id": contractor_id,
             "contractor_assigned_name": contractor_name,
-            # Must be one of: pending_assignment, assigned, contractor_assigned, in_progress, completed, cancelled
+            # Must be one of your defined options:
+            # pending_assignment, assigned, contractor_assigned, in_progress, completed, cancelled
             "job_status": "contractor_assigned",
         },
     }
 
     logger.info(
-        "Updating Jobs object on assignment via %s with payload: %s",
+        "Updating Jobs object on assignment via %s with params locationId=%s and payload: %s",
         JOBS_RECORDS_URL,
+        GHL_LOCATION_ID,
         payload,
     )
 
     try:
-        # NOTE: no params={"locationId": ...} here to avoid 422 "property locationId should not exist"
+        # 🔴 IMPORTANT: add locationId as a QUERY PARAM, not in the body.
         resp = requests.post(
             JOBS_RECORDS_URL,
             headers=_ghl_headers(),
+            params={"locationId": GHL_LOCATION_ID},
             json=payload,
             timeout=10,
         )
@@ -197,7 +204,6 @@ def upsert_job_assignment_to_ghl(job_id: str, contractor_id: str, contractor_nam
             )
     except Exception as e:
         logger.error("Jobs object assignment upsert exception: %s", e)
-
 
 # ---------------------------------------------------------
 # Routes
