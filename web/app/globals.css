@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+@theme {
+  /* Alloy Brand Colors */
+  --color-alloy-blue: #00458C;
+  --color-alloy-pine: #273F52;
+  --color-alloy-juniper: #00A283;
+  --color-alloy-ember: #BC4300;
+  --color-alloy-stone: #F4F6F9;
+  --color-alloy-midnight: #18273A;
+  
+  /* Font */
+  --font-sans: var(--font-poppins), system-ui, sans-serif;
+}
+
+body {
+  background: var(--color-alloy-stone);
+  color: var(--color-alloy-midnight);
+  font-family: var(--font-poppins), system-ui, sans-serif;
+}
